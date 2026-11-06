@@ -967,6 +967,70 @@ IInspectable *__cdecl platform_object_ctor(IInspectable *this)
     return this;
 }
 
+/* Vtable for IBoxArray/IBox types implementing IInspectable */
+static HRESULT WINAPI iboxarray_QueryInterface(IInspectable *iface, const GUID *iid, void **out)
+{
+    TRACE("(%p, %s, %p)\n", iface, debugstr_guid(iid), out);
+
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) || IsEqualGUID(iid, &IID_IAgileObject))
+    {
+        IInspectable_AddRef((*out = iface));
+        return S_OK;
+    }
+
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI iboxarray_AddRef(IInspectable *iface)
+{
+    return 1;
+}
+
+static ULONG WINAPI iboxarray_Release(IInspectable *iface)
+{
+    return 1;
+}
+
+static HRESULT WINAPI iboxarray_GetIids(IInspectable *iface, ULONG *count, GUID **iids)
+{
+    FIXME("(%p, %p, %p) stub\n", iface, count, iids);
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI iboxarray_GetRuntimeClassName(IInspectable *iface, HSTRING *class_name)
+{
+    FIXME("(%p, %p) stub\n", iface, class_name);
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI iboxarray_GetTrustLevel(IInspectable *iface, TrustLevel *trust_level)
+{
+    FIXME("(%p, %p) stub\n", iface, trust_level);
+    return E_NOTIMPL;
+}
+
+static const IInspectableVtbl iboxarray_vtable = {
+    iboxarray_QueryInterface,
+    iboxarray_AddRef,
+    iboxarray_Release,
+    iboxarray_GetIids,
+    iboxarray_GetRuntimeClassName,
+    iboxarray_GetTrustLevel,
+};
+
+void *WINAPI GetIBoxArrayVtable(void *param)
+{
+    TRACE("(%p)\n", param);
+    return &iboxarray_vtable;
+}
+
+void *WINAPI GetIBoxVtable(void *param)
+{
+    TRACE("(%p)\n", param);
+    return &iboxarray_vtable;
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
 {
     if (reason == DLL_PROCESS_ATTACH)
