@@ -91,6 +91,9 @@ struct bluetooth_radio
     /* Guarded by device_list_cs */
     LIST_ENTRY irp_list;
     LONG le_discovery_refs; /* Callers that have LE discovery running. Guarded by discovery_cs */
+    /* BlueZ aborts LE connections while a discovery is running, so discovery is stopped while a
+     * device connects and started again once the last one is done. Guarded by discovery_cs */
+    BOOL discovery_paused;
 };
 
 struct bluetooth_remote_device
@@ -466,6 +469,59 @@ static BOOL bluetooth_device_is_le( winebluetooth_device_props_mask_t mask, cons
 
 static void bluetooth_device_enable_le_iface( struct bluetooth_remote_device *device );
 
+/* BlueZ interrupts LE connections while a discovery is running, so a connection only completes
+ * reliably once discovery has stopped. The stop must happen before the device's props_cs is taken:
+ * stopping a discovery waits for the event loop thread, and that thread needs props_cs to deliver
+ * the discovery events it is blocked on. */
+static void bluetooth_pause_le_discovery( struct bluetooth_radio *radio )
+{
+    EnterCriticalSection( &discovery_cs );
+    if (!radio->discovery_paused)
+    {
+        TRACE( "Pausing LE discovery on %s to connect a device\n", debugstr_w( radio->hw_name ) );
+        radio->discovery_paused = TRUE;
+        if (radio->le_discovery_refs)
+            winebluetooth_radio_stop_discovery( radio->radio );
+    }
+    LeaveCriticalSection( &discovery_cs );
+}
+
+/* Starts a paused discovery again once no device is connecting, and pauses it again as soon as one
+ * is. Idempotent: call it after any change to a device's connecting state, without props_cs held. */
+static void bluetooth_update_le_discovery( struct bluetooth_radio *radio )
+{
+    struct bluetooth_remote_device *device;
+    BOOL connecting = FALSE;
+
+    EnterCriticalSection( &device_list_cs );
+    LIST_FOR_EACH_ENTRY( device, &radio->remote_devices, struct bluetooth_remote_device, entry )
+    {
+        EnterCriticalSection( &device->props_cs );
+        connecting = device->connecting;
+        LeaveCriticalSection( &device->props_cs );
+        if (connecting) break;
+    }
+    LeaveCriticalSection( &device_list_cs );
+
+    EnterCriticalSection( &discovery_cs );
+    if (connecting && !radio->discovery_paused)
+    {
+        TRACE( "Pausing LE discovery on %s to connect a device\n", debugstr_w( radio->hw_name ) );
+        radio->discovery_paused = TRUE;
+        if (radio->le_discovery_refs)
+            winebluetooth_radio_stop_discovery( radio->radio );
+    }
+    else if (!connecting && radio->discovery_paused)
+    {
+        TRACE( "Resuming LE discovery on %s\n", debugstr_w( radio->hw_name ) );
+        radio->discovery_paused = FALSE;
+        /* A watcher may have started while discovery was paused. */
+        if (radio->le_discovery_refs)
+            winebluetooth_radio_start_discovery( radio->radio, TRUE );
+    }
+    LeaveCriticalSection( &discovery_cs );
+}
+
 static NTSTATUS bluetooth_remote_device_dispatch( DEVICE_OBJECT *device, struct bluetooth_remote_device *ext, IRP *irp )
 {
     IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation( irp );
@@ -480,12 +536,21 @@ static NTSTATUS bluetooth_remote_device_dispatch( DEVICE_OBJECT *device, struct 
     case IOCTL_WINEBTH_LE_DEVICE_GET_GATT_SERVICES:
     {
         const SIZE_T min_size = offsetof( struct winebth_le_device_get_gatt_services_params, services[0] );
+        BOOL connecting = FALSE;
 
         if (!irp->AssociatedIrp.SystemBuffer || outsize < min_size)
         {
             status = STATUS_INVALID_USER_BUFFER;
             break;
         }
+        /* Windows connects on demand when services are requested, so stop advertising discovery
+         * first when that is about to happen. The state is read twice: the pause needs the lock
+         * released, and the body re-checks it anyway. */
+        EnterCriticalSection( &ext->props_cs );
+        connecting = !ext->props.connected && !ext->connecting;
+        LeaveCriticalSection( &ext->props_cs );
+        if (connecting)
+            bluetooth_pause_le_discovery( ext->radio );
         EnterCriticalSection( &ext->props_cs );
         if (ext->props.connected && ext->props.services_resolved)
             status = bluetooth_device_fill_gatt_services( ext, irp );
@@ -509,6 +574,9 @@ static NTSTATUS bluetooth_remote_device_dispatch( DEVICE_OBJECT *device, struct 
             }
         }
         LeaveCriticalSection( &ext->props_cs );
+        /* Restarts discovery when no connection ended up in flight. */
+        if (connecting)
+            bluetooth_update_le_discovery( ext->radio );
         break;
     }
     case IOCTL_WINEBTH_LE_DEVICE_GET_GATT_CHARACTERISTICS:
@@ -742,6 +810,9 @@ static NTSTATUS bluetooth_radio_dispatch( DEVICE_OBJECT *device, struct bluetoot
         EnterCriticalSection( &discovery_cs );
         if (ext->le_discovery_refs++)
             status = STATUS_SUCCESS;
+        else if (ext->discovery_paused)
+            /* A device is connecting. bluetooth_update_le_discovery starts it afterwards. */
+            status = STATUS_SUCCESS;
         else if ((status = winebluetooth_radio_start_discovery( ext->radio, TRUE )))
             ext->le_discovery_refs--;
         LeaveCriticalSection( &discovery_cs );
@@ -784,7 +855,9 @@ static NTSTATUS bluetooth_radio_dispatch( DEVICE_OBJECT *device, struct bluetoot
     }
     case IOCTL_WINEBTH_RADIO_STOP_DISCOVERY:
         EnterCriticalSection( &discovery_cs );
-        if (ext->le_discovery_refs > 0 && --ext->le_discovery_refs)
+        if (ext->le_discovery_refs > 0) ext->le_discovery_refs--;
+        if (ext->le_discovery_refs || ext->discovery_paused)
+            /* Discovery is already stopped while a device is connecting. */
             status = STATUS_SUCCESS;
         else
             status = winebluetooth_radio_stop_discovery( ext->radio );
@@ -1397,6 +1470,9 @@ static void bluetooth_radio_remove_remote_device( struct winebluetooth_watcher_e
                 if (radio->started)
                     IoInvalidateDeviceRelations( radio->device_obj, BusRelations );
                 LeaveCriticalSection( &device_list_cs );
+                /* A device removed while connecting must not leave discovery paused; take the lock
+                 * again only after releasing device_list_cs, which the resume needs. */
+                bluetooth_update_le_discovery( radio );
                 winebluetooth_device_free( event.device );
                 return;
             }
@@ -2051,7 +2127,7 @@ static BOOL bluetooth_device_unowned( struct bluetooth_remote_device *device )
 
 static void bluetooth_device_connect_finished( struct winebluetooth_watcher_event_connect_finished event )
 {
-    struct bluetooth_radio *radio;
+    struct bluetooth_radio *radio, *event_radio = NULL;
     BOOL drop = FALSE;
 
     TRACE( "device %p irp %p result %#lx\n", (void *)event.device.handle, event.irp, event.result );
@@ -2063,6 +2139,7 @@ static void bluetooth_device_connect_finished( struct winebluetooth_watcher_even
         LIST_FOR_EACH_ENTRY( device, &radio->remote_devices, struct bluetooth_remote_device, entry )
         {
             if (!winebluetooth_device_equal( event.device, device->device )) continue;
+            event_radio = radio;
             EnterCriticalSection( &device->props_cs );
             device->connecting = FALSE;
             /* BlueZ aborts LE connections to devices with long advertising intervals. A second attempt
@@ -2105,6 +2182,9 @@ done:
         winebluetooth_device_disconnect( event.device );
     }
     winebluetooth_device_free( event.device );
+    /* The device may connect again through the retry above, which keeps discovery paused. */
+    if (event_radio)
+        bluetooth_update_le_discovery( event_radio );
 }
 
 static DWORD CALLBACK bluetooth_event_loop_thread_proc( void *arg )
@@ -2252,7 +2332,56 @@ static NTSTATUS WINAPI fdo_pnp( DEVICE_OBJECT *device_obj, IRP *irp )
         case IRP_MN_REMOVE_DEVICE:
         {
             struct bluetooth_radio *device, *cur;
+            winebluetooth_device_t *disconnect = NULL;
+            unsigned int count = 0, i = 0;
             NTSTATUS ret;
+
+            /* Disconnect the devices still connected, so the driver does not just vanish from BlueZ:
+             * a sensor left with a stale client keeps advertising as connected until its own
+             * supervision timeout. Collected under the lock and disconnected after releasing it,
+             * because disconnecting waits for the event loop, which needs device_list_cs. */
+            EnterCriticalSection( &device_list_cs );
+            LIST_FOR_EACH_ENTRY( device, &device_list, struct bluetooth_radio, entry )
+            {
+                struct bluetooth_remote_device *remote_device;
+
+                LIST_FOR_EACH_ENTRY( remote_device, &device->remote_devices, struct bluetooth_remote_device, entry )
+                {
+                    EnterCriticalSection( &remote_device->props_cs );
+                    if (remote_device->props.connected || remote_device->connecting) count++;
+                    LeaveCriticalSection( &remote_device->props_cs );
+                }
+            }
+            if (count && !(disconnect = ExAllocatePool( PagedPool, count * sizeof(*disconnect) )))
+                ERR( "Failed to allocate memory, not disconnecting devices\n" );
+            if (disconnect)
+            {
+                LIST_FOR_EACH_ENTRY( device, &device_list, struct bluetooth_radio, entry )
+                {
+                    struct bluetooth_remote_device *remote_device;
+
+                    LIST_FOR_EACH_ENTRY( remote_device, &device->remote_devices, struct bluetooth_remote_device, entry )
+                    {
+                        EnterCriticalSection( &remote_device->props_cs );
+                        /* A connection may have started since the counting pass; the array is
+                         * sized for that pass, so stop filling it when it is full. */
+                        if ((remote_device->props.connected || remote_device->connecting) && i < count)
+                        {
+                            TRACE( "Disconnecting %p on driver shutdown\n", (void *)remote_device->device.handle );
+                            winebluetooth_device_dup( remote_device->device );
+                            disconnect[i++] = remote_device->device;
+                        }
+                        LeaveCriticalSection( &remote_device->props_cs );
+                    }
+                }
+            }
+            LeaveCriticalSection( &device_list_cs );
+            for (count = 0; count < i; count++)
+            {
+                winebluetooth_device_disconnect( disconnect[count] );
+                winebluetooth_device_free( disconnect[count] );
+            }
+            if (disconnect) ExFreePool( disconnect );
 
             winebluetooth_shutdown();
             WaitForSingleObject( event_loop_thread, INFINITE );
