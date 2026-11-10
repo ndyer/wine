@@ -29,8 +29,6 @@
 #include <dlfcn.h>
 #include <assert.h>
 #include <pthread.h>
-#include <semaphore.h>
-#include <errno.h>
 #include <string.h>
 #include <inttypes.h>
 
@@ -393,51 +391,27 @@ static BOOL parse_uuid( GUID *guid, const char *str )
     return TRUE;
 }
 
-static void bluez_dbus_wait_for_reply_callback( DBusPendingCall *pending_call, void *wait )
-{
-    sem_post( wait );
-}
-
 static NTSTATUS bluez_dbus_pending_call_wait( DBusPendingCall *pending_call, DBusMessage **reply, DBusError *error )
 {
-    sem_t wait;
+    /* Pump the connection while waiting instead of waiting for bluez_dbus_loop to dispatch the
+     * reply: the wait is used from that loop's own thread (e.g. resuming LE discovery after a
+     * device connects), where nothing else would ever dispatch the reply and the loop would
+     * deadlock, leaving every later GATT operation pending. The pending call's timeout still
+     * bounds the wait, so a reply that never arrives fails instead of hanging. */
+    p_dbus_pending_call_block( pending_call );
 
-    sem_init( &wait, 0, 0 );
-    if (!p_dbus_pending_call_set_notify( pending_call, bluez_dbus_wait_for_reply_callback, &wait, NULL ))
+    *reply = p_dbus_pending_call_steal_reply( pending_call );
+    p_dbus_pending_call_unref( pending_call );
+    if (p_dbus_set_error_from_message( error, *reply ))
     {
-        sem_destroy( &wait );
-        p_dbus_pending_call_unref( pending_call );
-        return STATUS_NO_MEMORY;
+        p_dbus_message_unref( *reply );
+        *reply = NULL;
     }
-    for (;;)
-    {
-        int ret = sem_wait( &wait );
-        if (!ret)
-        {
-            *reply = p_dbus_pending_call_steal_reply( pending_call );
-            if (p_dbus_set_error_from_message( error, *reply ))
-            {
-                p_dbus_message_unref( *reply );
-                *reply = NULL;
-            }
-            p_dbus_pending_call_unref( pending_call );
-            sem_destroy( &wait );
-            return STATUS_SUCCESS;
-        }
-        if (errno == EINTR)
-            continue;
-
-        ERR( "Failed to wait for DBus method reply: %s\n", debugstr_a( strerror( errno ) ) );
-        sem_destroy( &wait );
-        p_dbus_pending_call_cancel( pending_call );
-        p_dbus_pending_call_unref( pending_call );
-        return STATUS_INTERNAL_ERROR;
-    }
+    return STATUS_SUCCESS;
 }
 
-/* Like dbus_connection_send_with_reply_and_block, but it does not acquire a lock on the connection, instead relying on
- * the main loop in bluez_dbus_loop. This is faster than send_with_reply_and_block.
- * This takes ownership of the request, so there is no need to unref it. */
+/* Sends a request and waits for its reply. This takes ownership of the request, so there is no need
+ * to unref it. */
 static NTSTATUS bluez_dbus_send_and_wait_for_reply( DBusConnection *connection, DBusMessage *request, DBusMessage **reply,
                                                     DBusError *error )
 {

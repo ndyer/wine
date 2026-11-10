@@ -2339,7 +2339,10 @@ static NTSTATUS WINAPI fdo_pnp( DEVICE_OBJECT *device_obj, IRP *irp )
             /* Disconnect the devices still connected, so the driver does not just vanish from BlueZ:
              * a sensor left with a stale client keeps advertising as connected until its own
              * supervision timeout. Collected under the lock and disconnected after releasing it,
-             * because disconnecting waits for the event loop, which needs device_list_cs. */
+             * because disconnecting waits for the event loop, which needs device_list_cs.
+             * In practice the devices are gone by now: the PnP manager removes the children before
+             * the FDO, so remote_device_pdo_pnp has disconnected and destroyed them already. This
+             * pass covers the ones whose PDO was never created. */
             EnterCriticalSection( &device_list_cs );
             LIST_FOR_EACH_ENTRY( device, &device_list, struct bluetooth_radio, entry )
             {
@@ -2744,7 +2747,21 @@ static NTSTATUS WINAPI remote_device_pdo_pnp( DEVICE_OBJECT *device_obj, struct 
     }
     case IRP_MN_REMOVE_DEVICE:
     {
+        BOOL was_connected;
+
         assert( ext->removed );
+        /* The PnP manager removes a device's children before the device itself, so by the
+         * time the FDO is removed this device is already unlinked and the FDO no longer sees
+         * it: disconnect here, while the BlueZ connection is still up. Removing a device that
+         * BlueZ already dropped is harmless, the disconnect then fails with "Not connected". */
+        EnterCriticalSection( &ext->props_cs );
+        was_connected = ext->props.connected || ext->connecting;
+        LeaveCriticalSection( &ext->props_cs );
+        if (was_connected)
+        {
+            TRACE( "Disconnecting %p on device removal\n", (void *)ext->device.handle );
+            winebluetooth_device_disconnect( ext->device );
+        }
         remote_device_destroy( ext );
         ret = STATUS_SUCCESS;
         break;
