@@ -1053,7 +1053,18 @@ void WINAPIV append_id( struct string_buffer *buffer, const WCHAR *format, ... )
 }
 
 
+/* Windows hands a BluetoothLEAdvertisementWatcher one event per advertisement packet, which a
+ * device emits several times a second. BlueZ instead signals a device's properties only when they
+ * change (RSSI included) and says nothing at all about a device that is connected, so reporting
+ * straight from those signals gives a watcher a couple of events a minute and lets its signal
+ * strength indicator decay even though the device is right there. Report the cached advertisement
+ * of every device in range on this interval so that a watcher sees a steady stream, and use the
+ * same interval to rate limit reports caused by real property changes. */
+#define WINEBTH_ADV_REPORT_INTERVAL_MS 100
+
 static HANDLE event_loop_thread;
+static HANDLE adv_report_thread;
+static HANDLE adv_report_stop_event;
 static NTSTATUS radio_get_hw_name_w( winebluetooth_radio_t radio, WCHAR **name )
 {
     char *name_a;
@@ -1628,13 +1639,13 @@ static void bluetooth_radio_update_device_props( struct winebluetooth_watcher_ev
                     bluetooth_device_complete_gatt_irps( device, STATUS_DEVICE_NOT_CONNECTED );
                 /* Any change to advertisement data while the device is in range counts as a new advertisement.
                  * Devices advertise many times a second, and each event crosses into user space, so signal
-                 * strength changes on their own are rate limited. */
+                 * strength changes on their own are rate limited to the advertisement report interval. */
                 if (event.changed_props_mask & WINEBLUETOOTH_DEVICE_LE_PROPERTIES &&
                     device->props_mask & WINEBLUETOOTH_DEVICE_PROPERTY_RSSI)
                 {
                     ULONGLONG now = GetTickCount64();
 
-                    if (now - device->last_adv_report >= 500)
+                    if (now - device->last_adv_report >= WINEBTH_ADV_REPORT_INTERVAL_MS)
                     {
                         device->last_adv_report = now;
                         bluetooth_device_fill_le_advertisement( device, &adv );
@@ -1662,6 +1673,51 @@ done:
     }
 
     LeaveCriticalSection( &device_list_cs );
+}
+
+/* Re-report the cached advertisement of every device in range whose last report is older than the
+ * report interval, so that a watcher sees the steady stream of advertisements Windows delivers.
+ * This is what keeps a device's signal strength fresh between the sparse BlueZ property changes,
+ * and it is the only source of reports while LE discovery is paused to connect a device. */
+static void bluetooth_radio_report_cached_advertisements( void )
+{
+    struct bluetooth_radio *radio;
+    ULONGLONG now = GetTickCount64();
+
+    EnterCriticalSection( &device_list_cs );
+    LIST_FOR_EACH_ENTRY( radio, &device_list, struct bluetooth_radio, entry )
+    {
+        struct bluetooth_remote_device *device;
+
+        LIST_FOR_EACH_ENTRY( device, &radio->remote_devices, struct bluetooth_remote_device, entry )
+        {
+            struct winebth_le_advertisement adv;
+            BOOL report_adv = FALSE;
+
+            EnterCriticalSection( &device->props_cs );
+            /* BlueZ only reports an RSSI for devices it has recently heard from. */
+            if (device->props_mask & WINEBLUETOOTH_DEVICE_PROPERTY_RSSI &&
+                now - device->last_adv_report >= WINEBTH_ADV_REPORT_INTERVAL_MS)
+            {
+                device->last_adv_report = now;
+                bluetooth_device_fill_le_advertisement( device, &adv );
+                report_adv = TRUE;
+            }
+            LeaveCriticalSection( &device->props_cs );
+
+            if (report_adv)
+                bluetooth_radio_report_le_advertisement( radio->device_obj, &adv );
+        }
+    }
+    LeaveCriticalSection( &device_list_cs );
+}
+
+static DWORD CALLBACK bluetooth_adv_report_thread_proc( void *arg )
+{
+    /* Re-report until the stop event is signalled by driver shutdown. */
+    while (WaitForSingleObject( adv_report_stop_event, WINEBTH_ADV_REPORT_INTERVAL_MS ) == WAIT_TIMEOUT)
+        bluetooth_radio_report_cached_advertisements();
+    return 0;
 }
 
 static void bluetooth_radio_report_auth_event( struct winebluetooth_auth_event event )
@@ -2321,6 +2377,9 @@ static NTSTATUS WINAPI fdo_pnp( DEVICE_OBJECT *device_obj, IRP *irp )
             break;
         }
         case IRP_MN_START_DEVICE:
+            adv_report_stop_event = CreateEventW( NULL, TRUE, FALSE, NULL );
+            adv_report_thread =
+                CreateThread( NULL, 0, bluetooth_adv_report_thread_proc, NULL, 0, NULL );
             event_loop_thread =
                 CreateThread( NULL, 0, bluetooth_event_loop_thread_proc, NULL, 0, NULL );
             irp->IoStatus.Status = STATUS_SUCCESS;
@@ -2385,6 +2444,20 @@ static NTSTATUS WINAPI fdo_pnp( DEVICE_OBJECT *device_obj, IRP *irp )
                 winebluetooth_device_free( disconnect[count] );
             }
             if (disconnect) ExFreePool( disconnect );
+
+            /* Stop re-reporting advertisements before the devices are torn down. */
+            if (adv_report_stop_event) SetEvent( adv_report_stop_event );
+            if (adv_report_thread)
+            {
+                WaitForSingleObject( adv_report_thread, INFINITE );
+                CloseHandle( adv_report_thread );
+                adv_report_thread = NULL;
+            }
+            if (adv_report_stop_event)
+            {
+                CloseHandle( adv_report_stop_event );
+                adv_report_stop_event = NULL;
+            }
 
             winebluetooth_shutdown();
             WaitForSingleObject( event_loop_thread, INFINITE );
